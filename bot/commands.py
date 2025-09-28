@@ -12,9 +12,17 @@ if TYPE_CHECKING:
 
 from config.settings import MOD_FLAG
 
-# NEW: import DB repos
 from data.whitelist_repo import wl_add, wl_remove, wl_count
-from data.strikes_repo import strike_get, strike_clear, cleanup_expired_strikes
+from data.strikes_repo import (
+    get_user_immunity, 
+    get_immunity_leaderboard, 
+    process_weekly_bonus,
+    add_positive_points,
+    strike_get,
+    strike_clear,
+
+)
+
 # Optional: if you add it, we'll use it; otherwise we fallback
 try:
     from data.strikes_repo import guild_stats  # async (guild_id) -> dict
@@ -271,20 +279,51 @@ def setup_commands(tree: app_commands.CommandTree, bot: 'ModerationBot'):
 
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-    @tree.command(name="cleanup_strikes", description="Delete expired strike records (DB)")
-    async def cleanup_strikes_cmd(interaction: discord.Interaction):
+    @tree.command(name="cleanup_strikes", description="Clean up expired strike records")
+    async def cleanup_strikes(interaction: discord.Interaction):
         if not interaction.user.guild_permissions.manage_guild:
             return await interaction.response.send_message(
                 "❌ Administrator permissions required.", ephemeral=True
             )
-        try:
-            cleaned = await cleanup_expired_strikes(str(interaction.guild_id))
-        except Exception as e:
-            return await interaction.response.send_message(f"❌ DB error: {e}", ephemeral=True)
-
-        await interaction.response.send_message(
-            f"✅ Cleaned up **{cleaned}** expired strike records.", ephemeral=True
+        
+        await interaction.response.defer(ephemeral=True)
+        
+        # Import the cleanup function from your strikes repo
+        from data.strikes_repo import cleanup_expired_strikes
+        
+        cleaned = await cleanup_expired_strikes(str(interaction.guild.id))
+        
+        embed = discord.Embed(
+            title="🧹 Strike Cleanup Complete",
+            color=discord.Color.green()
         )
+        
+        if cleaned > 0:
+            embed.description = f"Cleaned up {cleaned} expired strike records."
+            embed.add_field(
+                name="✅ Completed",
+                value=f"• Removed {cleaned} expired records\n• Preserved records with positive points\n• Reset strike counts for good users",
+                inline=False
+            )
+        else:
+            embed.description = "No expired strike records found to clean up."
+            embed.add_field(
+                name="ℹ️ Status", 
+                value="Database is already clean!",
+                inline=False
+            )
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        
+        # Log the cleanup
+        try:
+            await bot.logger.log_system_event(
+                interaction.guild, "Strike Cleanup",
+                f"{interaction.user.mention} cleaned up {cleaned} expired strike records",
+                "info"
+            )
+        except Exception as e:
+            print(f"Error logging cleanup: {e}")
 
     @tree.command(name="bot_info", description="Show bot information and diagnostics")
     async def bot_info(interaction: discord.Interaction):
@@ -332,3 +371,260 @@ def setup_commands(tree: app_commands.CommandTree, bot: 'ModerationBot'):
             embed.add_field(name="Permissions", value="\n".join(perm_status), inline=False)
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @tree.command(name="user_immunity", description="Check user's immunity status and positive points")
+    async def user_immunity(interaction: discord.Interaction, user: discord.User = None):
+        if not interaction.user.guild_permissions.manage_messages:
+            return await interaction.response.send_message(
+                "❌ Manage Messages permission required.", ephemeral=True
+            )
+        
+        target_user = user or interaction.user
+        immunity = await get_user_immunity(str(interaction.guild.id), str(target_user.id))
+        
+        # Create embed with immunity status
+        embed = discord.Embed(
+            title=f"🛡️ Community Immunity Status: {target_user.display_name}",
+        )
+        
+        # Immunity level with emoji
+        level_emojis = {
+            "none": "⚪ None",
+            "trusted": "🟢 Trusted Member", 
+            "veteran": "🔵 Veteran Guardian",
+            "guardian": "🟣 Community Guardian"
+        }
+        
+        embed.add_field(
+            name="Immunity Level", 
+            value=level_emojis.get(immunity["immunity_level"], "❓ Unknown"),
+            inline=True
+        )
+        
+        embed.add_field(
+            name="Positive Points",
+            value=f"{immunity['positive_points']:,}",
+            inline=True
+        )
+        
+        embed.add_field(
+            name="Current Strikes", 
+            value=str(immunity["strikes"]),
+            inline=True
+        )
+        
+        # Show what they can bypass
+        bypass_abilities = []
+        if immunity["can_bypass_warnings"]:
+            bypass_abilities.append("✅ Minor warnings")
+        if immunity["can_bypass_minor_flags"]:
+            bypass_abilities.append("✅ Moderate flags")  
+        if immunity["can_bypass_all_but_severe"]:
+            bypass_abilities.append("✅ All but severe violations")
+        
+        if bypass_abilities:
+            embed.add_field(
+                name="🛡️ Can Bypass",
+                value="\n".join(bypass_abilities),
+                inline=False
+            )
+        else:
+            embed.add_field(
+                name="🛡️ Bypass Abilities", 
+                value="No immunity protections",
+                inline=False
+            )
+        
+        # Next threshold
+        if immunity["next_threshold"]:
+            points_needed = immunity["next_threshold"] - immunity["positive_points"]
+            embed.add_field(
+                name="📈 Next Level",
+                value=f"Need {points_needed:,} more points",
+                inline=True
+            )
+        else:
+            embed.add_field(
+                name="📈 Status",
+                value="🎉 Maximum level achieved!",
+                inline=True
+            )
+        
+        if target_user.avatar:
+            embed.set_thumbnail(url=target_user.avatar.url)
+        
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @tree.command(name="immunity_leaderboard", description="Show top community members by positive points")
+    async def immunity_leaderboard(interaction: discord.Interaction, limit: int = 10):
+        if limit > 20:
+            limit = 20
+        
+        leaderboard = await get_immunity_leaderboard(str(interaction.guild.id), limit)
+        
+        if not leaderboard:
+            embed = discord.Embed(
+                title="🏆 Community Immunity Leaderboard",
+                description="No positive points recorded yet!",
+                color=discord.Color.blue()
+            )
+            return await interaction.response.send_message(embed=embed, ephemeral=True)
+        
+        embed = discord.Embed(
+            title="🏆 Community Immunity Leaderboard", 
+            description=f"Top {len(leaderboard)} members by positive behavior",
+            color=discord.Color.gold()
+        )
+        
+        leaderboard_text = []
+        for i, entry in enumerate(leaderboard, 1):
+            user = interaction.guild.get_member(int(entry["user_id"]))
+            name = user.display_name if user else f"User {entry['user_id']}"
+            
+            level_emoji = {
+                "guardian": "🟣",
+                "veteran": "🔵", 
+                "trusted": "🟢",
+                "none": "⚪"
+            }.get(entry["immunity_level"], "❓")
+            
+            points = entry["positive_points"]
+            strikes = entry["count"] or 0
+            
+            leaderboard_text.append(
+                f"**{i}.** {level_emoji} {name}\n"
+                f"     💎 {points:,} points • ⚠️ {strikes} strikes"
+            )
+        
+        embed.add_field(
+            name="Rankings",
+            value="\n".join(leaderboard_text),
+            inline=False
+        )
+        
+        embed.set_footer(text="Earn points through positive behavior!")
+        
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @tree.command(name="award_points", description="Manually award positive points to a user")
+    async def award_points(interaction: discord.Interaction, user: discord.User, points: int, reason: str = None):
+        if not interaction.user.guild_permissions.manage_guild:
+            return await interaction.response.send_message(
+                "❌ Administrator permissions required.", ephemeral=True
+            )
+        
+        if points < 1 or points > 100:
+            return await interaction.response.send_message(
+                "❌ Points must be between 1 and 100.", ephemeral=True
+            )
+        
+        await add_positive_points(
+            str(interaction.guild.id), 
+            str(user.id), 
+            points, 
+            reason or f"Manual award by {interaction.user.display_name}"
+        )
+        
+        # Get updated immunity status
+        immunity = await get_user_immunity(str(interaction.guild.id), str(user.id))
+        
+        embed = discord.Embed(
+            title="✨ Positive Points Awarded!",
+            color=discord.Color.green()
+        )
+        
+        embed.add_field(name="User", value=user.mention, inline=True)
+        embed.add_field(name="Points Awarded", value=f"+{points}", inline=True) 
+        embed.add_field(name="New Total", value=f"{immunity['positive_points']:,}", inline=True)
+        
+        if reason:
+            embed.add_field(name="Reason", value=reason, inline=False)
+        
+        # Show if they gained immunity level
+        level_emojis = {
+            "trusted": "🟢 Trusted Member",
+            "veteran": "🔵 Veteran Guardian", 
+            "guardian": "🟣 Community Guardian"
+        }
+        
+        if immunity["immunity_level"] != "none":
+            embed.add_field(
+                name="🛡️ Immunity Level",
+                value=level_emojis.get(immunity["immunity_level"], immunity["immunity_level"]),
+                inline=False
+            )
+        
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        
+        # Log the manual award
+        await bot.logger.log_system_event(
+            interaction.guild, "Manual Points Award",
+            f"{interaction.user.mention} awarded {points} points to {user.mention}. Reason: {reason or 'No reason given'}",
+            "success"
+        )
+
+    @tree.command(name="weekly_bonus", description="Award weekly bonuses to well-behaved users")
+    async def weekly_bonus(interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.manage_guild:
+            return await interaction.response.send_message(
+                "❌ Administrator permissions required.", ephemeral=True
+            )
+        
+        await interaction.response.defer(ephemeral=True)
+        
+        awarded_users = await process_weekly_bonus(str(interaction.guild.id))
+        
+        if not awarded_users:
+            embed = discord.Embed(
+                title="📅 Weekly Bonus Check",
+                description="No users qualified for weekly bonuses at this time.",
+                color=discord.Color.blue()
+            )
+            return await interaction.followup.send(embed=embed, ephemeral=True)
+        
+        embed = discord.Embed(
+            title="🎉 Weekly Bonuses Awarded!",
+            description=f"Awarded bonuses to {len(awarded_users)} well-behaved members",
+            color=discord.Color.green()
+        )
+        
+        bonus_text = []
+        for award in awarded_users[:10]:  # Show max 10
+            user = interaction.guild.get_member(int(award["user_id"]))
+            name = user.display_name if user else f"User {award['user_id']}"
+            
+            bonus_text.append(
+                f"🎁 **{name}**\n"
+                f"   +{award['points_awarded']} points → {award['total_points']:,} total"
+            )
+        
+        embed.add_field(
+            name="Recipients",
+            value="\n".join(bonus_text),
+            inline=False
+        )
+        
+        if len(awarded_users) > 10:
+            embed.add_field(
+                name="Additional",
+                value=f"...and {len(awarded_users) - 10} more members received bonuses!",
+                inline=False
+            )
+        
+        embed.set_footer(text="Weekly bonuses encourage consistent good behavior!")
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        
+        # Also send a summary to mod log if configured
+        try:
+            summary = f"🎉 **Weekly Bonus Round Complete**\n"
+            summary += f"• **{len(awarded_users)} members** received bonuses\n" 
+            summary += f"• **Total points awarded:** {sum(a['points_awarded'] for a in awarded_users):,}\n"
+            summary += f"• **Processed by:** {interaction.user.mention}"
+            
+            await bot.logger.log_system_event(
+                interaction.guild, "Weekly Bonuses Awarded",
+                summary, "success"
+            )
+        except Exception as e:
+            print(f"Error logging weekly bonus: {e}")

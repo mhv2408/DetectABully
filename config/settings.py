@@ -60,3 +60,36 @@ FALLBACK_PATTERNS = {
         r"\b(trash|garbage|worthless)\b(?=.*you|.*@)"
     ]
 }
+
+# Add these to your existing config/settings.py file
+
+# Community Immunity System Settings
+IMMUNITY_THRESHOLDS = {
+    "trusted": 100,    # Can bypass warnings (toxicity 0.4-0.6)
+    "veteran": 500,    # Can bypass minor flags (toxicity 0.6-0.7)  
+    "guardian": 1000   # Can bypass all but severe violations (0.8+)
+}
+
+# Point award system
+POINT_VALUES = {
+    "clean_message": 1,      # Per message with toxicity < 0.1
+    "helpful_reaction": 3,   # Per helpful reaction given (future feature)
+    "quality_message": 5,    # Long message (>50 chars) with 0.0 toxicity
+    "weekly_bonus": 50,      # 7 days without violations
+    "strike_penalty": -10    # Per strike received
+}
+
+# Immunity bypass rules
+IMMUNITY_RULES = {
+    "severe_bypass_threshold": 0.85,  # Guardian can bypass severe < this score
+    "rule_violations_stricter": True,  # Rule-based violations harder to bypass
+    "max_strikes_for_immunity": 3,    # Lose immunity if strikes >= this
+    "immunity_reset_on_severe": True  # Severe violation reduces points
+}
+
+# Discord role rewards (optional)
+IMMUNITY_ROLES = {
+    "trusted": "Trusted Member",     # Role name to assign
+    "veteran": "Veteran Guardian", 
+    "guardian": "Community Guardian"
+}

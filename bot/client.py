@@ -109,7 +109,7 @@ class ModerationBot:
 
         # Classify message content
         level, reason, analysis = await self.classifier.classify_message(
-            message.content, message.author.id
+            message.content, message.author.id, message.guild.id
         )
         if level == "none":
             return
