@@ -15,6 +15,9 @@ MOD_LOG_CHANNEL_ID = int(os.getenv("MOD_LOG_CHANNEL_ID", "0"))
 PERSPECTIVE_API_KEY = os.getenv("PERSPECTIVE_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
+#Databae URL
+DATABASE_URL = os.getenv("DATABASE_URL")
+
 # Moderation Settings
 MOD_FLAG = "[modbot]"
 STRIKE_WINDOW_MINUTES = 60
