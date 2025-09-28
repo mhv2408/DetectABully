@@ -201,6 +201,16 @@ def setup_commands(tree: app_commands.CommandTree, bot: 'ModerationBot'):
             )
         
         cleared = bot.strikes.clear_strikes(interaction.guild.id, user.id)
+
+        # Also remove active timeout if present
+        member = interaction.guild.get_member(user.id)
+        if member and member.communication_disabled_until:
+            try:
+                await member.edit(timed_out_until=None, reason="Strikes cleared")
+            except discord.Forbidden:
+                await interaction.followup.send("❌ Bot lacks permission to remove timeout.", ephemeral=True)
+            except discord.HTTPException as e:
+                await interaction.followup.send(f"❌ Failed to remove timeout: {e}", ephemeral=True)
         
         if cleared:
             await interaction.response.send_message(

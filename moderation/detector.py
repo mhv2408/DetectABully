@@ -42,6 +42,7 @@ class ToxicityDetector:
             
             analyze_request = {
                 'comment': {'text': text},
+                'languages':["en"],
                 'requestedAttributes': {
                     'TOXICITY': {},
                     'SEVERE_TOXICITY': {},

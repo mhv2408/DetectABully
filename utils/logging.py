@@ -40,7 +40,7 @@ class ModLogger:
         
         embed = discord.Embed(
             title=f"🛡️ Moderation Action - {level.upper()}",
-            color=self.color_map.get(level, discord.Color.gray()),
+            color=self.color_map.get(level, discord.Color.dark_grey()),
             timestamp=datetime.now(timezone.utc)
         )
         
