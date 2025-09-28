@@ -2,6 +2,8 @@
 
 Advanced Discord moderation bot with **AI toxicity detection** and **Community Immunity System** that rewards positive behavior.
 
+## Video Pitch (URL) - https://youtu.be/_yVLAeilMeg
+
 ## ✨ Key Features
 
 - **Dual AI Detection**: Google Perspective API + OpenAI for toxicity analysis
