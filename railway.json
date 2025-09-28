@@ -1,0 +1,7 @@
+{
+  "build": {
+    "nixpacks": {
+      "pythonVersion": "3.12"
+    }
+  }
+}
