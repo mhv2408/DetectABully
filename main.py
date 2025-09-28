@@ -1,5 +1,6 @@
+# main.py
 import os, re, time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import asyncio
 from dotenv import load_dotenv
 import discord
@@ -14,17 +15,19 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
 intents.messages = True
+# (No members intent needed; we'll fetch member via HTTP when needed.)
 
 bot = discord.Client(intents=intents)
 tree = app_commands.CommandTree(bot)
 
-# ---------- Config / State (MVP: in-memory) ----------
-moderated_channels = set()  # channel IDs
-# strikes[(guild_id, user_id)] = {"count": int, "reset_at": timestamp}
-strikes = {}
+# ---------- Config / State ----------
+MOD_FLAG = "[modbot]"                 # marker in channel topic
+moderated_channels = set()            # channel IDs detected from topic at boot
+strikes = {}                          # (guild_id, user_id) -> {"count": int, "reset_at": ts}
 
-# Basic rules (extend later)
+# ---------- Rules ----------
 SLUR_RE = re.compile(r"(?i)\b(stupid|idiot|moron|kys|retard)\b")
+
 def is_caps_spam(text: str) -> bool:
     letters = [c for c in text if c.isalpha()]
     if len(letters) < 12: return False
@@ -32,18 +35,18 @@ def is_caps_spam(text: str) -> bool:
     return caps / max(1, len(letters)) > 0.7
 
 def is_targeted_insult(text: str) -> bool:
-    # naive: insult + an @mention in the same message
     return ("<@" in text or "@" in text) and SLUR_RE.search(text) is not None
 
 def classify_message(text: str):
     """Return (level, reason). levels: none | warn | flag | severe"""
     t = text.strip()
     if not t: return ("none", "")
-    if SLUR_RE.search(t):    return ("severe", "slur detected")
-    if is_targeted_insult(t):return ("flag",   "targeted insult")
-    if is_caps_spam(t):      return ("warn",   "excessive shouting")
+    if SLUR_RE.search(t):     return ("severe", "slur detected")
+    if is_targeted_insult(t): return ("flag",   "targeted insult")
+    if is_caps_spam(t):       return ("warn",   "excessive shouting")
     return ("none", "")
 
+# ---------- Helpers ----------
 async def dm_user(user: discord.User | discord.Member, content: str):
     try:
         dm = await user.create_dm()
@@ -52,9 +55,15 @@ async def dm_user(user: discord.User | discord.Member, content: str):
         pass
 
 async def log_mod(guild: discord.Guild, content: str):
-    if MOD_LOG_CHANNEL_ID == 0: return
-    ch = guild.get_channel(MOD_LOG_CHANNEL_ID) or await guild.fetch_channel(MOD_LOG_CHANNEL_ID)
-    await ch.send(content)
+    if MOD_LOG_CHANNEL_ID == 0:
+        print("[mod-log] Not configured"); return
+    try:
+        ch = guild.get_channel(MOD_LOG_CHANNEL_ID) or await guild.fetch_channel(MOD_LOG_CHANNEL_ID)
+        await ch.send(content)
+    except discord.Forbidden:
+        print("[mod-log] 403 Missing Access – fix channel perms for the bot")
+    except Exception as e:
+        print(f"[mod-log] error: {e}")
 
 def bump_strike(guild_id: int, user_id: int, window_minutes: int = 60) -> int:
     key = (guild_id, user_id)
@@ -66,52 +75,102 @@ def bump_strike(guild_id: int, user_id: int, window_minutes: int = 60) -> int:
     strikes[key] = entry
     return entry["count"]
 
+def topic_has_flag(topic: str | None) -> bool:
+    return bool(topic) and MOD_FLAG.lower() in topic.lower()
+
 # ---------- Slash commands ----------
-@tree.command(name="moderate_here", description="Toggle moderation for this channel")
+@tree.command(name="moderate_here", description=f"Toggle moderation for this channel (adds/removes {MOD_FLAG} in topic)")
 async def moderate_here(inter: discord.Interaction):
     if not inter.user.guild_permissions.manage_guild:
         return await inter.response.send_message("Admins only.", ephemeral=True)
-    cid = inter.channel_id
-    if cid in moderated_channels:
-        moderated_channels.remove(cid)
-        await inter.response.send_message("✅ Disabled moderation in this channel.", ephemeral=True)
-    else:
-        moderated_channels.add(cid)
-        await inter.response.send_message("✅ Enabled moderation in this channel.", ephemeral=True)
 
-@tree.command(name="mod_status", description="Show which channels are moderated")
+    # Ensure we’re in a text channel
+    ch = inter.channel
+    if not isinstance(ch, discord.TextChannel):
+        return await inter.response.send_message("Run this in a text channel.", ephemeral=True)
+
+    topic = ch.topic or ""
+    try:
+        if topic_has_flag(topic):
+            # remove flag
+            new_topic = topic.replace(MOD_FLAG, "")
+            new_topic = " ".join(new_topic.split())  # tidy spaces
+            await ch.edit(topic=new_topic or None)
+            moderated_channels.discard(ch.id)
+            msg = f"✅ Disabled moderation here. (Removed {MOD_FLAG} from topic)"
+        else:
+            # add flag
+            sep = "" if (not topic or topic.endswith(" ")) else " "
+            new_topic = (topic or "") + f"{sep}{MOD_FLAG}"
+            await ch.edit(topic=new_topic)
+            moderated_channels.add(ch.id)
+            msg = f"✅ Enabled moderation here. (Added {MOD_FLAG} to topic)"
+        await inter.response.send_message(msg, ephemeral=True)
+    except discord.Forbidden:
+        await inter.response.send_message(
+            "❌ I need **Manage Channels** permission to edit the topic here.",
+            ephemeral=True
+        )
+    except Exception as e:
+        await inter.response.send_message(f"❌ Failed to toggle: {e}", ephemeral=True)
+
+@tree.command(name="mod_status", description="Show which channels are moderated (topic contains the mod flag)")
 async def mod_status(inter: discord.Interaction):
     names = []
-    for cid in moderated_channels:
+    for cid in sorted(moderated_channels):
         ch = inter.guild.get_channel(cid)
         names.append(f"<#{cid}>" if ch else str(cid))
     txt = "Moderated: " + (", ".join(names) if names else "None")
     await inter.response.send_message(txt, ephemeral=True)
 
+@tree.command(name="diag", description="Bot diagnostics")
+async def diag(inter: discord.Interaction):
+    if not inter.user.guild_permissions.manage_guild:
+        return await inter.response.send_message("Admins only.", ephemeral=True)
+    # Check mod-log perms quickly
+    modlog = "n/a"
+    try:
+        ch = inter.guild.get_channel(MOD_LOG_CHANNEL_ID) or await inter.guild.fetch_channel(MOD_LOG_CHANNEL_ID)
+        perms = ch.permissions_for(inter.guild.me)
+        modlog = f"view={perms.view_channel}, send={perms.send_messages}, read_hist={perms.read_message_history}"
+    except Exception as e:
+        modlog = f"error: {e}"
+    chans = ", ".join(f"<#{c}>" for c in moderated_channels) or "None"
+    await inter.response.send_message(
+        f"Intents: message_content={bot.intents.message_content}\n"
+        f"Moderated: {chans}\n"
+        f"mod-log perms: {modlog}",
+        ephemeral=True
+    )
+
 # ---------- Events ----------
 @bot.event
 async def on_ready():
+    # Rebuild moderated_channels by scanning topics
+    moderated_channels.clear()
+    for g in bot.guilds:
+        for ch in g.text_channels:
+            if topic_has_flag(ch.topic):
+                moderated_channels.add(ch.id)
     try:
         await tree.sync()
     except Exception:
         pass
     print(f"Logged in as {bot.user} (latency {bot.latency:.3f}s)")
+    print(f"[boot] Moderating {len(moderated_channels)} channels: {sorted(moderated_channels)}")
 
 @bot.event
 async def on_message(message: discord.Message):
     # ignore self/bots
     if message.author.bot: return
-    if message.guild is None: return  # ignore DMs for moderation
+    if message.guild is None: return
     if message.channel.id not in moderated_channels: return
 
     level, reason = classify_message(message.content)
     if level == "none":
         return
 
-    # escalate strikes
     count = bump_strike(message.guild.id, message.author.id)
-
-    # Prepare WhyCard text
     why = (
         f"**User:** <@{message.author.id}>\n"
         f"**Channel:** <#{message.channel.id}>\n"
@@ -120,33 +179,35 @@ async def on_message(message: discord.Message):
         f"**Excerpt:** {message.content[:180]}"
     )
 
+    action_note = ""
     try:
         if level == "warn":
             await dm_user(message.author, f"Please keep it respectful. Reason: {reason}")
-            await log_mod(message.guild, why + "\n_Action_: DM warn")
+            action_note = "DM warn"
         elif level == "flag":
-            # delete + log
             await message.delete()
             await dm_user(message.author, "Your message was removed for targeted harassment.")
-            await log_mod(message.guild, why + "\n_Action_: Deleted + warned")
+            action_note = "Deleted + warned"
         elif level == "severe":
             await message.delete()
-            # timeout 30m if possible; else fallback to kick
             member = await message.guild.fetch_member(message.author.id)
-            until = datetime.utcnow() + timedelta(minutes=30)
+            until = datetime.now(timezone.utc) + timedelta(minutes=30)
             try:
-                await member.timeout(until=until, reason="Severe harassment")
-                await log_mod(message.guild, why + "\n_Action_: Deleted + 30m timeout")
-            except Exception:
+                await member.timeout(until, reason="Severe harassment")  # positional 'until'
+                action_note = "Deleted + 30m timeout"
+            except discord.Forbidden:
+                # fallback to kick if timeout not permitted
                 try:
                     await member.kick(reason="Severe harassment")
-                    await log_mod(message.guild, why + "\n_Action_: Deleted + KICKED")
-                except Exception:
-                    await log_mod(message.guild, why + "\n_Action_: Deleted (no timeout/kick perms)")
+                    action_note = "Deleted + KICKED (timeout not permitted)"
+                except discord.Forbidden:
+                    action_note = "Deleted (no timeout/kick perms)"
     except discord.Forbidden:
-        await log_mod(message.guild, why + "\n_Action_: FAILED (missing permission)")
+        action_note = "FAILED (missing permission)"
     except Exception as e:
-        await log_mod(message.guild, why + f"\n_Action_: ERROR {e}")
+        action_note = f"ERROR {e}"
+
+    await log_mod(message.guild, why + f"\n_Action_: {action_note}")
 
 # ---------- Run ----------
 if __name__ == "__main__":
